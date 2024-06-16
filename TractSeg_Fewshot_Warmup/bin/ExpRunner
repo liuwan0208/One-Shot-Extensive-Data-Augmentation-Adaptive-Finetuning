@@ -1,0 +1,164 @@
+#!/usr/bin/env python
+
+"""
+This module is for training the model. See Readme.md for more details about training your own model.
+
+Examples:
+    Run local:
+    $ ExpRunner --config=XXX
+
+    Predicting with new config setup:
+    $ ExpRunner --train=False --test=True --lw --config=XXX
+"""
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import warnings
+import os
+import importlib
+import argparse
+import pickle as pkl
+from pprint import pprint
+import distutils.util
+from os.path import join
+import os
+
+import nibabel as nib
+import numpy as np
+import torch
+
+from tractseg.libs import data_utils
+from tractseg.libs import direction_merger
+from tractseg.libs import exp_utils
+from tractseg.libs import img_utils
+from tractseg.libs import peak_utils
+from tractseg.libs.system_config import SystemConfig as C
+from tractseg.libs import trainer
+from tractseg.data.data_loader_training import DataLoaderTraining as DataLoaderTraining2D
+from tractseg.data.data_loader_training_3D import DataLoaderTraining as DataLoaderTraining3D
+from tractseg.data.data_loader_inference import DataLoaderInference
+from tractseg.data import dataset_specific_utils
+from tractseg.models.base_model import BaseModel
+from bin.utils_add import compute_dice_score
+
+warnings.simplefilter("ignore", UserWarning)  # hide scipy warnings
+warnings.simplefilter("ignore", FutureWarning)  # hide h5py warnings
+warnings.filterwarnings("ignore", message="numpy.dtype size changed")  # hide Cython benign warning
+warnings.filterwarnings("ignore", message="numpy.ufunc size changed")  # hide Cython benign warning
+
+
+# finetune
+train_sub = ["845458"]
+
+
+daug_sub = ['daug_0', 'daug_1', 'daug_2', 'daug_3', 'daug_4', 'daug_5', 'daug_6', 'daug_7', 'daug_8', 'daug_9',
+			'daug_10','daug_11','daug_12','daug_13','daug_14','daug_15','daug_16','daug_17','daug_18','daug_19',
+			'daug_20','daug_21','daug_22','daug_23','daug_24','daug_25','daug_26','daug_27','daug_28','daug_29',
+			'daug_30','daug_31','daug_32','daug_33','daug_34','daug_35','daug_36','daug_37','daug_38','daug_39',
+			'daug_40','daug_41','daug_42','daug_43','daug_44','daug_45','daug_46','daug_47','daug_48','daug_49',
+			'daug_50','daug_51','daug_52','daug_53','daug_54','daug_55','daug_56','daug_57','daug_58','daug_59',
+			'daug_60','daug_61','daug_62','daug_63','daug_64','daug_65','daug_66','daug_67','daug_68','daug_69',
+			'daug_70','daug_71','daug_72','daug_73','daug_74','daug_75','daug_76','daug_77','daug_78','daug_79',
+			'daug_80','daug_81','daug_82','daug_83','daug_84','daug_85','daug_86','daug_87','daug_88','daug_89',
+			'daug_90','daug_91','daug_92','daug_93','daug_94','daug_95','daug_96','daug_97','daug_98','daug_99']
+
+tt_sub = ['A00']
+
+
+def main():
+	parser = argparse.ArgumentParser(description="Train a network on your own data to segment white matter bundles.",
+									 epilog="Written by Jakob Wasserthal. Please reference 'Wasserthal et al. "
+											"TractSeg - Fast and accurate white matter tract segmentation. "
+											"https://doi.org/10.1016/j.neuroimage.2018.07.070)'")
+	parser.add_argument("--config", metavar="name", help="Name of configuration to use",
+						default='my_custom_experiment')
+	parser.add_argument("--train", metavar="True/False", help="Train network",
+						type=distutils.util.strtobool, default=True)
+	parser.add_argument("--test", metavar="True/False", help="Test network",
+						type=distutils.util.strtobool, default=False)
+	parser.add_argument("--seg", action="store_true", help="Create binary segmentation", default=True)
+	parser.add_argument("--probs", action="store_true", help="Create probmap segmentation")
+	parser.add_argument("--lw", action="store_true", help="Load weights of pretrained net")
+	parser.add_argument("--only_val", action="store_true", help="only run validation")
+	parser.add_argument("--en", metavar="name", help="Experiment name")
+	parser.add_argument("--fold", metavar="N", help="Which fold to train when doing CrossValidation", type=int)
+	parser.add_argument("--verbose", action="store_true", help="Show more intermediate output", default=True)
+	args = parser.parse_args()
+
+	Config = getattr(importlib.import_module("tractseg.experiments.base"), "Config")()
+	if args.config:
+		# Config.__dict__ does not work properly therefore use this approach
+		Config = getattr(importlib.import_module("tractseg.experiments.custom." + args.config), "Config")()
+
+	if args.en:
+		Config.EXP_NAME = args.en  ## my_custom_experiment
+
+	Config.TRAIN = bool(args.train)  ## True
+	Config.TEST = bool(args.test)  ## False
+	Config.SEGMENT = args.seg  ## False
+	if args.probs:
+		Config.GET_PROBS = True  ## False
+	if args.lw:
+		Config.LOAD_WEIGHTS = args.lw  ## False
+	if args.fold:
+		Config.CV_FOLD = args.fold  ## 0
+	if args.only_val:
+		Config.ONLY_VAL = True  ## False
+	Config.VERBOSE = args.verbose  ## True:show more intermedia output
+
+	Config.MULTI_PARENT_PATH = join(C.EXP_PATH, Config.EXP_MULTI_NAME)  ## '//home/wanliu/TractSeg/hcp_exp/'
+	Config.EXP_PATH = join(C.EXP_PATH, Config.EXP_MULTI_NAME,
+						   Config.EXP_NAME)  ## '/home/wanliu/TractSeg/hcp_exp/my_custom_experiment'
+
+	##### modify subject numbers
+	if Config.TUNE_DATA=='HCP':
+		if Config.WARM_NUM==1:
+			Config.TRAIN_SUBJECTS = train_sub[0:1]
+			Config.VALIDATE_SUBJECTS = train_sub[0:1]
+	if Config.TUNE_DATA=='TT':
+		if Config.WARM_NUM == 1:
+			Config.TRAIN_SUBJECTS = tt_sub[0:1]
+			Config.VALIDATE_SUBJECTS = tt_sub[0:1]
+	Config.TEST_SUBJECTS = []
+
+
+	if Config.USE_DAUG==True:
+		Config.TRAIN_SUBJECTS += daug_sub[0:Config.AUG_NUM]
+
+	# Autoset input dimensions based on settings
+	Config.INPUT_DIM = dataset_specific_utils.get_correct_input_dim(Config)  ## (144,144)
+	Config = dataset_specific_utils.get_labels_filename(Config)  ## 'LABELS_FILENAME': 'bundle_masks_72'
+
+	if Config.EXPERIMENT_TYPE == "peak_regression":
+		Config.NR_OF_CLASSES = 3 * len(dataset_specific_utils.get_bundle_names(Config.CLASSES)[1:])
+	else:
+		Config.NR_OF_CLASSES = len(dataset_specific_utils.get_bundle_names(Config.CLASSES)[1:])  ## 72
+
+	if Config.TRAIN and not Config.ONLY_VAL:
+		Config.EXP_PATH = exp_utils.create_experiment_folder(Config.EXP_NAME, Config.MULTI_PARENT_PATH, Config.TRAIN)
+
+	if Config.TRAIN:
+		if Config.VERBOSE:
+			print("Hyperparameters:")
+			exp_utils.print_Configs(Config)
+
+		with open(join(Config.EXP_PATH, "Hyperparameters.txt"), "a") as f:
+			Config_dict = {attr: getattr(Config, attr) for attr in dir(Config)
+						   if not callable(getattr(Config, attr)) and not attr.startswith("__")}
+			pprint(Config_dict, f)
+		if Config.DIM == "2D":
+			data_loader = DataLoaderTraining2D(Config)
+		else:
+			data_loader = DataLoaderTraining3D(Config)
+		print("Training...")
+		model = BaseModel(Config)
+		trainer.train_model(Config, model, data_loader)
+
+
+
+if __name__ == '__main__':
+	os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+	main()
+
